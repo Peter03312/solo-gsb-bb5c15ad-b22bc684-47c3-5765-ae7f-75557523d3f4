@@ -108,9 +108,26 @@ CREATE TABLE IF NOT EXISTS registration_corrections (
   corrected_at   TEXT NOT NULL
 );
 
+-- 现场临时代班（仅当前执行版可变更；发布新版后代班不延续，旧版记录只读可查）
+CREATE TABLE IF NOT EXISTS position_substitutions (
+  id             INTEGER PRIMARY KEY AUTOINCREMENT,
+  version_id     INTEGER NOT NULL REFERENCES rehearsal_versions(id) ON DELETE CASCADE,
+  position       TEXT NOT NULL,              -- 被代班岗位（须存在于该版 published_cues）
+  deputy_user_id INTEGER NOT NULL REFERENCES users(id),
+  enabled_by     TEXT NOT NULL,              -- 启用操作者（舞监显示名）
+  enabled_at     TEXT NOT NULL,              -- 启用时间 YYYY-MM-DD HH:MM:SS
+  revoked_by     TEXT,                       -- 撤销操作者（舞监显示名）
+  revoked_at     TEXT,                       -- 撤销时间
+  UNIQUE(version_id, position, deputy_user_id)
+);
+-- 每个版本每个岗位至多一名在任（未撤销）代班
+CREATE UNIQUE INDEX IF NOT EXISTS idx_sub_active
+  ON position_substitutions(version_id, position) WHERE revoked_at IS NULL;
+
 CREATE INDEX IF NOT EXISTS idx_pcues_version ON published_cues(version_id);
 CREATE INDEX IF NOT EXISTS idx_reg_version ON registrations(version_id);
 CREATE INDEX IF NOT EXISTS idx_corr_version ON registration_corrections(version_id);
+CREATE INDEX IF NOT EXISTS idx_sub_version ON position_substitutions(version_id);
 `);
 
 // 幂等迁移：旧库的 registrations 表没有交接来源列时补齐（CREATE TABLE IF NOT EXISTS 不会改既有表）

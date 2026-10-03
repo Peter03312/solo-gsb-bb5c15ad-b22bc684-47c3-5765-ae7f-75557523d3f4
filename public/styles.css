@@ -96,6 +96,16 @@ tr.ho-ineligible td { background: #fdf7f6; }
 .ho-reasons li { margin: 2px 0; white-space: normal; }
 .ho-stale { color: #c0392b; }
 .handover-tag { display: inline-block; margin-top: 2px; font-size: 11px; color: #1d6f52; background: #e2f5ee; border-radius: 6px; padding: 0 6px; white-space: nowrap; }
+
+/* 现场临时代班 */
+.sub-box { border: 1px solid #d3d9e2; background: #fafbfd; }
+.sub-form { display: flex; gap: 10px; flex-wrap: wrap; margin-bottom: 12px; }
+.sub-form select { flex: 1; min-width: 180px; }
+.sub-tag { display: inline-block; margin-top: 2px; font-size: 11px; color: #6b3fa0; background: #f1e8fb; border-radius: 6px; padding: 0 6px; white-space: nowrap; }
+.sub-info-banner { background: #f3eefc; border: 1px solid #cdb8ec; color: #4a2d75; border-radius: 10px; padding: 10px 14px; margin-bottom: 16px; font-size: 13px; }
+.sub-info-banner.warn { background: #fdf6e9; border-color: #e6c88f; color: #8a5a12; }
+.sub-log { margin-top: 10px; font-size: 12px; }
+.sub-log summary { cursor: pointer; color: #556; margin-bottom: 6px; }
 .reg-actions { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; }
 .reg-actions input[type="time"] { width: 92px; padding: 5px 8px; }
 .own-row td { background: #f3f8ff; }

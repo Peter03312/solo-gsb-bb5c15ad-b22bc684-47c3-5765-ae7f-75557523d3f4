@@ -124,7 +124,26 @@
           <button id="live-reload" class="ghost">刷新</button>
         </div>
         <div id="live-meta" class="panel"></div>
+        <div id="live-sub-info"></div>
         <div id="live-conflicts"></div>
+
+        <!-- 舞监：现场临时代班（仅当前执行版可变更） -->
+        <div id="sub-box" class="panel sub-box" hidden>
+          <h3>现场临时代班（仅当前执行版）</h3>
+          <p class="muted">
+            选择本版岗位与已有执行账号启用代班：代班期间<strong>原岗位账号失去该岗位登记权</strong>，
+            代班账号获得该岗位登记权并<strong>保留自己原有岗位权限</strong>；每版每岗至多一名在任代班。
+            发布新版后代班不自动延续，旧版代班记录只读可查（见「发布版本」回看）。
+          </p>
+          <form id="sub-form" class="sub-form">
+            <select name="position" id="sub-position" required></select>
+            <select name="username" id="sub-username" required></select>
+            <button type="submit" class="primary">启用代班</button>
+          </form>
+          <div id="sub-active-body"></div>
+          <div id="sub-log-body"></div>
+          <p class="muted">撤销后持旧页面提交登记将被拒绝且不改登记；每次启用/撤销都记录操作者与时间。</p>
+        </div>
         <div class="panel">
           <div class="table-wrap">
             <table>

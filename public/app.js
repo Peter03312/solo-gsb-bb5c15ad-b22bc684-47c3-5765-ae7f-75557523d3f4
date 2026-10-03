@@ -10,6 +10,7 @@ const state = {
   editingCueId: null,
   handover: null,
   handoverLoading: false,
+  subs: null,
 };
 
 const $ = (sel, root = document) => root.querySelector(sel);
@@ -459,7 +460,53 @@ $('#draft-reload').addEventListener('click', () =>
 async function loadLive() {
   const data = await api('GET', '/api/live');
   state.live = data.version;
+  // 舞监面板需要执行账号清单；执行账号直接使用 live 内嵌的 substitutions 识别代班岗位
+  if (state.me?.role === 'sm' && state.live) {
+    try { state.subs = await api('GET', '/api/substitutions'); } catch { state.subs = null; }
+  } else {
+    state.subs = null;
+  }
   renderLive();
+}
+
+// 该岗位当前在任代班（取自已嵌入 live 的 substitutions）
+function activeSubFor(position) {
+  return (state.live?.substitutions?.active || []).find((s) => s.position === position) || null;
+}
+
+// 当前执行账号在当前版本可登记的全部岗位（本岗未被代班 + 自己的在任代班岗）
+function myEffectivePositions() {
+  if (!state.live || state.me?.role !== 'operator') return [];
+  const out = [];
+  const active = state.live.substitutions?.active || [];
+  const mineTaken = active.some((s) => s.position === state.me.position);
+  if (state.me.position && !mineTaken) out.push(state.me.position);
+  for (const s of active) {
+    if (s.deputy.username === state.me.username) out.push(s.position);
+  }
+  return [...new Set(out)];
+}
+
+function renderSubInfo() {
+  const box = $('#live-sub-info');
+  if (!box) return;
+  if (state.me?.role !== 'operator' || !state.live) { box.innerHTML = ''; return; }
+  const active = state.live.substitutions?.active || [];
+  const mine = active.filter((s) => s.deputy.username === state.me.username);
+  const myPosTaken = active.find((s) => s.position === state.me.position);
+  const parts = [];
+  if (myPosTaken) {
+    parts.push(`你的本岗「${esc(state.me.position)}」当前由 <strong>${esc(myPosTaken.deputy.displayName)}（${esc(myPosTaken.deputy.username)}）</strong>代班，你暂不能登记本岗提示项`);
+  }
+  if (mine.length) {
+    parts.push(`你正在代班岗位：<strong>${mine.map((s) => esc(s.position)).join('、')}</strong>，可登记这些岗位的提示项（同时保留你原有岗位权限）`);
+  }
+  if (active.length) {
+    parts.push(`当前在任代班 ${active.length} 项：${active.map((s) =>
+      `「${esc(s.position)}」← ${esc(s.deputy.displayName)}（${esc(s.deputy.username)}）`).join('；')}`);
+  }
+  box.innerHTML = parts.length
+    ? `<div class="sub-info-banner ${myPosTaken ? 'warn' : ''}">🎫 ${parts.join('　｜　')}</div>` : '';
 }
 
 function statusBadge(s) {
@@ -481,6 +528,8 @@ function renderLive() {
   if (!v) {
     $('#live-meta').innerHTML = '<div class="muted">尚未发布任何联排版本，请等待舞监发布。</div>';
     $('#live-conflicts').innerHTML = '';
+    $('#live-sub-info').innerHTML = '';
+    $('#sub-box').hidden = true;
     $('#live-tbody').innerHTML = '';
     return;
   }
@@ -488,20 +537,29 @@ function renderLive() {
     `<strong>第 ${v.versionNo} 版</strong>　${esc(v.note)}　<span class="muted">发布于 ${esc(v.createdAt)}</span>
      ${v.isLatest ? '<span class="latest-tag">当前执行版本</span>' : '<span class="latest-tag" style="background:#999">非最新版本</span>'}`;
   renderConflicts(v.conflicts);
-
+  renderSubInfo();
   const isOp = state.me.role === 'operator';
   const isSM = state.me.role === 'sm';
-  const myPos = state.me.position;
+  $('#sub-box').hidden = !(isSM && v.isLatest);
+  if (isSM && v.isLatest) renderSubPanel();
+
+  const myPositions = new Set(myEffectivePositions());
   const canReg = isOp && v.isLatest;
   $('#live-col-reg').textContent = isSM ? '登记更正' : '岗位登记';
   $('#sm-correct-hint').hidden = !isSM;
 
   $('#live-tbody').innerHTML = v.cues.map((c) => {
-    const mine = isOp && c.position === myPos;
+    const mine = isOp && myPositions.has(c.position);
+    const sub = activeSubFor(c.position);
+    const subTag = sub
+      ? `<div class="sub-tag" title="代班：${esc(sub.deputy.displayName)}（${esc(sub.deputy.username)}），启用 ${esc(sub.enabledAt)}">🎫 ${esc(sub.deputy.displayName)}代班</div>`
+      : '';
     const delayed = c.delayed ? `<div class="delayed">已顺延</div>` : '';
     let reg = '<span class="muted">—</span>';
     if (canReg && mine) {
       reg = renderRegControls(c);
+    } else if (isOp && c.position === state.me.position && sub) {
+      reg = '<span class="muted">本岗代班中</span>';
     } else if (mine && isOp) {
       reg = '<span class="muted">本岗位（版本已归档）</span>';
     } else if (isSM) {
@@ -510,7 +568,7 @@ function renderLive() {
     return `<tr class="${mine ? 'own-row' : ''}" data-cue="${c.id}">
       <td><strong>${esc(c.code)}</strong></td>
       <td>${esc(c.title)}</td>
-      <td>${esc(c.position)}</td>
+      <td>${esc(c.position)}${subTag}</td>
       <td class="mono">${c.plannedStartText} - ${minText(c.plannedStart + c.duration)}</td>
       <td class="mono">${c.schedStartText}${delayed}</td>
       <td class="mono">${c.schedEndText}</td>
@@ -585,12 +643,95 @@ $('#live-tbody').addEventListener('click', async (ev) => {
     renderLive();
   } catch (e) {
     alertBar('error', errorToHtml(e));
-    if (e.status === 409) loadLive().catch(() => {});
+    // 409 行版本冲突；403 可能是代班刚被撤销/启用导致授权变化：均刷新现场
+    if (e.status === 409 || e.status === 403) loadLive().catch(() => {});
   }
 });
 
 $('#live-reload').addEventListener('click', () =>
   loadLive().then(() => alertBar('ok', '已刷新')).catch((e) => alertBar('error', errorToHtml(e))));
+
+// ---------- 舞监：现场临时代班 ----------
+
+function renderSubPanel() {
+  const box = $('#sub-box');
+  if (!box || box.hidden) return;
+  const s = state.subs;
+  const posSel = $('#sub-position');
+  const userSel = $('#sub-username');
+  posSel.innerHTML = '<option value="">选择岗位</option>' +
+    (s?.positions || []).map((p) => `<option value="${esc(p)}">${esc(p)}</option>`).join('');
+  userSel.innerHTML = '<option value="">选择执行账号</option>' +
+    (s?.operators || []).map((u) =>
+      `<option value="${esc(u.username)}">${esc(u.displayName)}（${esc(u.username)}·${esc(u.position || '—')}）</option>`).join('');
+
+  const active = s?.active || [];
+  $('#sub-active-body').innerHTML = active.length
+    ? `<div class="table-wrap"><table>
+        <thead><tr><th>岗位</th><th>代班账号</th><th>启用操作者</th><th>启用时间</th><th>操作</th></tr></thead>
+        <tbody>${active.map((a) => `<tr>
+          <td><strong>${esc(a.position)}</strong></td>
+          <td>${esc(a.deputy.displayName)}（${esc(a.deputy.username)}·原岗 ${esc(a.deputy.position || '—')}）</td>
+          <td>${esc(a.enabledBy)}</td>
+          <td class="mono">${esc(a.enabledAt)}</td>
+          <td><button class="danger tiny" data-act="revoke-sub" data-id="${a.id}" data-position="${esc(a.position)}">撤销代班</button></td>
+        </tr>`).join('')}</tbody>
+      </table></div>`
+    : '<div class="muted">当前执行版暂无在任代班。</div>';
+
+  const log = s?.log || [];
+  $('#sub-log-body').innerHTML = log.length
+    ? `<details class="sub-log"><summary>代班变更记录（${log.length}）</summary>
+        <div class="table-wrap"><table>
+          <thead><tr><th>变更</th><th>岗位</th><th>代班账号</th><th>操作者</th><th>时间</th></tr></thead>
+          <tbody>${log.map((e) => `<tr>
+            <td>${e.change === 'enable'
+              ? '<span class="badge running">启用</span>'
+              : '<span class="badge done">撤销</span>'}</td>
+            <td>${esc(e.position)}</td>
+            <td>${esc(e.deputy.displayName)}（${esc(e.deputy.username)}）</td>
+            <td>${esc(e.by)}</td>
+            <td class="mono">${esc(e.at)}</td>
+          </tr>`).join('')}</tbody>
+        </table></div></details>`
+    : '';
+}
+
+$('#sub-form').addEventListener('submit', async (ev) => {
+  ev.preventDefault();
+  const fd = new FormData(ev.target);
+  const position = String(fd.get('position') || '');
+  const username = String(fd.get('username') || '');
+  if (!position || !username) return alertBar('error', '请选择岗位与执行账号');
+  if (!confirm(`确认由「${username}」代班岗位「${position}」？启用期间原岗位账号将失去该岗位登记权。`)) return;
+  try {
+    state.subs = await api('POST', '/api/substitutions', { position, username });
+    alertBar('ok', `已启用代班：「${username}」代班「${position}」`);
+    ev.target.reset();
+    renderSubPanel();
+    // 授权已变化，刷新现场可操作项
+    const data = await api('GET', '/api/live');
+    state.live = data.version;
+    renderLive();
+  } catch (e) { alertBar('error', errorToHtml(e)); }
+});
+
+$('#sub-active-body').addEventListener('click', async (ev) => {
+  const btn = ev.target.closest('button[data-act="revoke-sub"]');
+  if (!btn) return;
+  if (!confirm(`确认撤销岗位「${btn.dataset.position}」的代班？撤销后原岗位账号恢复登记权。`)) return;
+  try {
+    state.subs = await api('POST', '/api/substitutions/revoke', { id: Number(btn.dataset.id) });
+    alertBar('ok', `已撤销「${btn.dataset.position}」代班`);
+    renderSubPanel();
+    const data = await api('GET', '/api/live');
+    state.live = data.version;
+    renderLive();
+  } catch (e) {
+    alertBar('error', errorToHtml(e));
+    if (e.status === 409) loadLive().catch(() => {});
+  }
+});
 
 // ---------- 舞监：现场登记更正 ----------
 
@@ -817,6 +958,32 @@ $('#version-detail').addEventListener('click', (ev) => {
   if (cue) openModal(`更正记录：${cue.code}`, renderHistoryHtml(cue, v));
 });
 
+function renderSubLogDetail(v) {
+  const sub = v.substitutions;
+  if (!sub) return '';
+  const active = sub.active || [];
+  const log = sub.log || [];
+  if (!active.length && !log.length) return '';
+  const activeHtml = active.length
+    ? `<div class="muted">该版在任代班：${active.map((a) =>
+        `「${esc(a.position)}」← ${esc(a.deputy.displayName)}（${esc(a.deputy.username)}），${esc(a.enabledBy)} 于 ${esc(a.enabledAt)} 启用`
+      ).join('；')}${v.isLatest ? '（当前执行版，可在「现场联排」页变更）' : '（该版已归档，代班记录只读）'}</div>`
+    : `<div class="muted">该版撤销时无在任代班${v.isLatest ? '' : '（旧版代班记录只读）'}。</div>`;
+  const logHtml = log.length
+    ? `<details class="sub-log" ${v.isLatest ? '' : 'open'}><summary>代班变更记录（${log.length}）</summary>
+        <div class="table-wrap"><table>
+          <thead><tr><th>变更</th><th>岗位</th><th>代班账号</th><th>操作者</th><th>时间</th></tr></thead>
+          <tbody>${log.map((e) => `<tr>
+            <td>${e.change === 'enable' ? '<span class="badge running">启用</span>' : '<span class="badge done">撤销</span>'}</td>
+            <td>${esc(e.position)}</td>
+            <td>${esc(e.deputy.displayName)}（${esc(e.deputy.username)}）</td>
+            <td>${esc(e.by)}</td>
+            <td class="mono">${esc(e.at)}</td>
+          </tr>`).join('')}</tbody>
+        </table></div></details>` : '';
+  return `<div class="panel sub-box"><h3>现场代班记录（第 ${v.versionNo} 版）</h3>${activeHtml}${logHtml}</div>`;
+}
+
 function renderDetail() {
   const v = state.detail;
   if (!v) return;
@@ -829,12 +996,17 @@ function renderDetail() {
       <div class="muted">${esc(v.note)} · 发布于 ${esc(v.createdAt)}</div>
     </div>
     ${conflictHtml}
+    ${renderSubLogDetail(v)}
     <div class="panel"><div class="table-wrap"><table>
       <thead><tr><th>编号</th><th>说明</th><th>岗位</th><th>计划</th><th>重算开始</th><th>重算结束</th><th>状态</th><th>实际开始</th><th>实际完成</th><th>预计结束</th><th>登记人/时间</th>${state.me?.role === 'sm' ? '<th>更正</th>' : ''}</tr></thead>
-      <tbody>${v.cues.map((c) => `<tr>
+      <tbody>${v.cues.map((c) => {
+        const sub = (v.substitutions?.active || []).find((s) => s.position === c.position);
+        const subTag = sub
+          ? `<div class="sub-tag" title="代班：${esc(sub.deputy.displayName)}（${esc(sub.deputy.username)}）">🎫 ${esc(sub.deputy.displayName)}代班</div>` : '';
+        return `<tr>
         <td><strong>${esc(c.code)}</strong></td>
         <td>${esc(c.title)}</td>
-        <td>${esc(c.position)}</td>
+        <td>${esc(c.position)}${subTag}</td>
         <td class="mono">${c.plannedStartText} - ${minText(c.plannedStart + c.duration)}</td>
         <td class="mono">${c.schedStartText}${c.delayed ? '<div class="delayed">顺延</div>' : ''}</td>
         <td class="mono">${c.schedEndText}</td>
@@ -844,7 +1016,8 @@ function renderDetail() {
         <td class="mono">${c.estimatedEndText ?? '—'}</td>
         <td class="muted">${c.updatedBy ? esc(c.updatedBy) + '<br>' + esc(c.updatedAt || '') : '—'}</td>
         <td>${state.me?.role === 'sm' ? renderCorrectionCell(c, v, 'detail') : ''}</td>
-      </tr>`).join('')}</tbody>
+      </tr>`;
+      }).join('')}</tbody>
     </table></div></div>`;
 }
 

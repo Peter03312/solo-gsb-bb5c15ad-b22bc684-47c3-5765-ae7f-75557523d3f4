@@ -183,6 +183,8 @@ function versionPayload(versionRow) {
     });
   }
 
+  const subData = substitutionData(versionRow.id);
+
   return {
     id: versionRow.id,
     versionNo: versionRow.version_no,
@@ -211,7 +213,77 @@ function versionPayload(versionRow) {
     })),
     conflicts: live.conflicts,
     orderProblem: live.orderProblem,
+    substitutions: subData,
   };
+}
+
+// ---------- 现场临时代班 ----------
+
+// 已发布版本包含的岗位（去重，按名称）
+function versionPositionSet(versionId) {
+  return new Set(
+    db.prepare('SELECT DISTINCT position FROM published_cues WHERE version_id = ?')
+      .all(versionId).map((r) => r.position)
+  );
+}
+
+// 某版本的代班数据：在任代班 + 全部启用/撤销变更日志（含操作者与时间）
+function substitutionData(versionId) {
+  const rows = db.prepare(
+    `SELECT s.*, u.username AS deputy_username, u.display_name AS deputy_name, u.position AS deputy_position
+     FROM position_substitutions s JOIN users u ON u.id = s.deputy_user_id
+     WHERE s.version_id = ?
+     ORDER BY s.enabled_at, s.id`
+  ).all(versionId);
+
+  const activeMap = new Map(); // position -> 记录
+  const log = [];
+  for (const s of rows) {
+    const active = s.revoked_at === null;
+    const entry = {
+      id: s.id,
+      position: s.position,
+      deputy: { username: s.deputy_username, displayName: s.deputy_name, position: s.deputy_position },
+      enabledBy: s.enabled_by,
+      enabledAt: s.enabled_at,
+      revokedBy: s.revoked_by,
+      revokedAt: s.revoked_at,
+      active,
+    };
+    if (active) activeMap.set(s.position, entry);
+    log.push({ change: 'enable', id: s.id, position: s.position,
+      deputy: entry.deputy, by: s.enabled_by, at: s.enabled_at });
+    if (s.revoked_at !== null) {
+      log.push({ change: 'revoke', id: s.id, position: s.position,
+        deputy: entry.deputy, by: s.revoked_by, at: s.revoked_at });
+    }
+  }
+  log.sort((a, b) => (a.at < b.at ? 1 : a.at > b.at ? -1 : b.id - a.id));
+  return { active: [...activeMap.values()], log };
+}
+
+// 代班面板负载：当前版本岗位、执行账号清单（仅舞监）、在任代班与变更日志
+function substitutionStatusPayload(versionRow, includeOperators) {
+  const payload = {
+    version: { id: versionRow.id, versionNo: versionRow.version_no, note: versionRow.note, createdAt: versionRow.created_at },
+    positions: [...versionPositionSet(versionRow.id)],
+    ...substitutionData(versionRow.id),
+  };
+  if (includeOperators) {
+    payload.operators = db.prepare(
+      `SELECT id, username, display_name, position FROM users WHERE role = 'operator' ORDER BY id`
+    ).all().map((u) => ({ id: u.id, username: u.username, displayName: u.display_name, position: u.position }));
+  }
+  return payload;
+}
+
+// 岗位在该版本当前是否被某执行账号有效拥有（原岗位未被代班 或 获得了该岗位代班）
+function accountHoldsPosition(versionId, user, position) {
+  const active = db.prepare(
+    'SELECT deputy_user_id FROM position_substitutions WHERE version_id = ? AND position = ? AND revoked_at IS NULL'
+  ).get(versionId, position);
+  if (active) return active.deputy_user_id === user.id;
+  return user.position === position;
 }
 
 // ---------- 认证 ----------
@@ -688,6 +760,138 @@ app.get('/api/live', requireAuth, (req, res, next) => {
   } catch (e) { next(e); }
 });
 
+// ---------- 舞监：现场临时代班（仅当前执行版） ----------
+
+// 代班面板：不传 versionId 时取当前执行版；舞监额外返回执行账号清单
+app.get('/api/substitutions', requireAuth, (req, res, next) => {
+  try {
+    let row;
+    if (req.query.versionId !== undefined) {
+      row = db.prepare('SELECT * FROM rehearsal_versions WHERE id = ?').get(Number(req.query.versionId));
+      if (!row) throw new ApiError(404, 'NOT_FOUND', '联排版本不存在');
+    } else {
+      row = db.prepare('SELECT * FROM rehearsal_versions ORDER BY version_no DESC LIMIT 1').get();
+    }
+    if (!row) return res.json({ version: null, positions: [], active: [], log: [] });
+    res.json(substitutionStatusPayload(row, req.session.user.role === 'sm'));
+  } catch (e) { next(e); }
+});
+
+// 历史/当前版本代班记录（只读，含每次启用/撤销的操作者与时间）
+app.get('/api/versions/:id/substitutions', requireAuth, (req, res, next) => {
+  try {
+    const row = db.prepare('SELECT * FROM rehearsal_versions WHERE id = ?').get(Number(req.params.id));
+    if (!row) throw new ApiError(404, 'NOT_FOUND', '联排版本不存在');
+    res.json(substitutionStatusPayload(row, req.session.user.role === 'sm'));
+  } catch (e) { next(e); }
+});
+
+// 启用某岗位代班：每版每岗至多一名在任代班，仅当前执行版可变更
+app.post('/api/substitutions', requireSM, (req, res, next) => {
+  try {
+    const position = String(req.body.position || '').trim();
+    const username = String(req.body.username || '').trim();
+    const result = db.transaction(() => {
+      const ver = db.prepare('SELECT * FROM rehearsal_versions ORDER BY version_no DESC LIMIT 1').get();
+      if (!ver) throw new ApiError(409, 'NO_PUBLISHED_VERSION', '尚未发布任何联排版本，无法安排代班');
+
+      if (!position) throw new ApiError(400, 'BAD_INPUT', '请选择需要代班的岗位');
+      const verPos = versionPositionSet(ver.id);
+      if (!verPos.has(position)) {
+        throw new ApiError(404, 'POSITION_NOT_IN_VERSION',
+          `岗位「${position}」不在当前执行版（第 ${ver.version_no} 版）中，无法为其安排代班`,
+          { availablePositions: [...verPos] });
+      }
+
+      if (!username) throw new ApiError(400, 'BAD_INPUT', '请选择代班执行账号');
+      const deputy = db.prepare("SELECT * FROM users WHERE username = ? AND role = 'operator'").get(username);
+      if (!deputy) {
+        const ops = db.prepare("SELECT username FROM users WHERE role = 'operator' ORDER BY id").all().map((u) => u.username);
+        throw new ApiError(404, 'UNKNOWN_OPERATOR', `未知或非执行账号「${username}」，无法安排代班`, { operators: ops });
+      }
+      if (deputy.position === position) {
+        throw new ApiError(400, 'BAD_INPUT',
+          `「${deputy.display_name}（${deputy.username}）」本身就是岗位「${position}」的在任执行账号，无需代班`);
+      }
+
+      const exists = db.prepare(
+        'SELECT id FROM position_substitutions WHERE version_id = ? AND position = ? AND revoked_at IS NULL'
+      ).get(ver.id, position);
+      if (exists) {
+        throw new ApiError(409, 'SUBSTITUTION_ACTIVE',
+          `岗位「${position}」在第 ${ver.version_no} 版已有在任代班，请先撤销后再重新安排`);
+      }
+
+      const actor = req.session.user.displayName;
+      const stamp = new Date().toLocaleString('sv-SE'); // YYYY-MM-DD HH:MM:SS
+      try {
+        db.prepare(
+          `INSERT INTO position_substitutions(version_id, position, deputy_user_id, enabled_by, enabled_at)
+           VALUES (?, ?, ?, ?, ?)`
+        ).run(ver.id, position, deputy.id, actor, stamp);
+      } catch (e) {
+        // 并发兜底：每版每岗唯一在任代班的部分唯一索引
+        if (/position_substitutions/.test(String(e?.message || ''))) {
+          throw new ApiError(409, 'SUBSTITUTION_ACTIVE',
+            `岗位「${position}」在第 ${ver.version_no} 版已有在任代班，请先撤销后再重新安排`);
+        }
+        throw e;
+      }
+      return ver;
+    })();
+
+    res.status(201).json(substitutionStatusPayload(result, true));
+  } catch (e) { next(e); }
+});
+
+// 撤销代班：按在任记录 id 或 (当前执行版, 岗位) 指定；已撤销/不存在均明确报错
+app.post('/api/substitutions/revoke', requireSM, (req, res, next) => {
+  try {
+    const hasId = req.body.id !== undefined && req.body.id !== null;
+    const position = req.body.position !== undefined && req.body.position !== null
+      ? String(req.body.position).trim() : '';
+    if (!hasId && !position) throw new ApiError(400, 'BAD_INPUT', '请指定要撤销的代班（id 或岗位）');
+
+    const result = db.transaction(() => {
+      const ver = db.prepare('SELECT * FROM rehearsal_versions ORDER BY version_no DESC LIMIT 1').get();
+      if (!ver) throw new ApiError(409, 'NO_PUBLISHED_VERSION', '尚未发布任何联排版本，无法撤销代班');
+
+      let sub;
+      if (hasId) {
+        const id = Number(req.body.id);
+        if (!Number.isInteger(id)) throw new ApiError(400, 'BAD_INPUT', '代班记录 id 无效');
+        sub = db.prepare('SELECT * FROM position_substitutions WHERE id = ?').get(id);
+        if (!sub) throw new ApiError(404, 'NOT_FOUND', '代班记录不存在');
+        if (sub.version_id !== ver.id) {
+          throw new ApiError(409, 'SUBSTITUTION_NOT_CURRENT',
+            `该代班属于第 ${(db.prepare('SELECT version_no FROM rehearsal_versions WHERE id = ?').get(sub.version_id) || {}).version_no ?? '?'} 版，仅当前执行版（第 ${ver.version_no} 版）可变更，旧版记录只读`);
+        }
+      } else {
+        sub = db.prepare(
+          'SELECT * FROM position_substitutions WHERE version_id = ? AND position = ? AND revoked_at IS NULL'
+        ).get(ver.id, position);
+        if (!sub) {
+          throw new ApiError(409, 'NO_ACTIVE_SUBSTITUTION',
+            `岗位「${position}」在当前执行版（第 ${ver.version_no} 版）没有在任代班，无需撤销`,
+            { availablePositions: [...versionPositionSet(ver.id)] });
+        }
+      }
+      if (sub.revoked_at !== null) {
+        throw new ApiError(409, 'SUBSTITUTION_REVOKED',
+          `岗位「${sub.position}」的该代班已于 ${sub.revoked_at} 被撤销，请勿重复撤销`);
+      }
+
+      const actor = req.session.user.displayName;
+      const stamp = new Date().toLocaleString('sv-SE');
+      db.prepare('UPDATE position_substitutions SET revoked_by = ?, revoked_at = ? WHERE id = ?')
+        .run(actor, stamp, sub.id);
+      return ver;
+    })();
+
+    res.json(substitutionStatusPayload(result, true));
+  } catch (e) { next(e); }
+});
+
 // ---------- 岗位：现场登记 ----------
 
 app.post('/api/registrations', requireAuth, (req, res, next) => {
@@ -697,63 +901,78 @@ app.post('/api/registrations', requireAuth, (req, res, next) => {
     const cueRef = Number(req.body.cueRef);
     const rowVersion = Number(req.body.rowVersion);
     const action = String(req.body.action || '');
-
-    const ver = db.prepare('SELECT * FROM rehearsal_versions WHERE id = ?').get(versionId);
-    if (!ver) throw new ApiError(404, 'NOT_FOUND', '联排版本不存在');
-    const latest = db.prepare('SELECT id FROM rehearsal_versions ORDER BY version_no DESC LIMIT 1').get();
-    if (!latest || latest.id !== ver.id) {
-      throw new ApiError(409, 'VERSION_ARCHIVED',
-        `第 ${ver.version_no} 版已不是当前执行版本（已有新版本发布），请刷新使用最新版本登记`);
-    }
-
-    const pc = db.prepare('SELECT * FROM published_cues WHERE version_id=? AND cue_ref=?').get(versionId, cueRef);
-    if (!pc) throw new ApiError(404, 'NOT_FOUND', '提示项不存在于该版本');
-    if (pc.position !== req.session.user.position) {
-      throw new ApiError(403, 'FORBIDDEN', `「${pc.code}」属于岗位「${pc.position}」，当前账号只能登记本岗位提示项`);
-    }
-
-    const reg = db.prepare('SELECT * FROM registrations WHERE version_id=? AND cue_ref=?').get(versionId, cueRef);
-    if (!reg) throw new ApiError(404, 'NOT_FOUND', '登记记录不存在');
-    if (rowVersion !== reg.row_ver) {
-      throw new ApiError(409, 'VERSION_CONFLICT',
-        `「${pc.code}」登记已被更新：当前行版本 ${reg.row_ver}，提交基于 ${rowVersion}，请刷新后重试`,
-        { currentRowVersion: reg.row_ver });
-    }
+    const user = req.session.user;
 
     const parseOptTime = (v) => (v === undefined || v === null || v === '' ? null : timeToMin(v));
-    let patch;
-    const actor = req.session.user.displayName;
+    const actor = user.displayName;
     const stamp = new Date().toLocaleString('sv-SE'); // YYYY-MM-DD HH:MM:SS
 
-    if (action === 'start') {
-      if (reg.actual_start !== null) throw new ApiError(400, 'BAD_STATE', `「${pc.code}」已登记实际开始`);
-      const t = parseOptTime(req.body.time) ?? currentMinute();
-      patch = { actual_start: t };
-    } else if (action === 'estimate') {
-      if (reg.actual_end !== null) throw new ApiError(400, 'BAD_STATE', `「${pc.code}」已完成，不能再修改预计结束`);
-      const ee = parseOptTime(req.body.estimatedEndText);
-      if (ee === null) throw new ApiError(400, 'BAD_INPUT', '请填写预计结束时间（HH:MM）');
-      const lower = reg.actual_start !== null ? reg.actual_start : pc.planned_start;
-      if (ee < lower) {
-        throw new ApiError(400, 'BAD_INPUT',
-          `预计结束 ${minToTime(ee)} 早于${reg.actual_start !== null ? '实际开始' : '原计划开始'} ${minToTime(lower)}`);
+    // 当前版、代班权限、登记行版本在同一事务内复核：
+    // 代班被撤销后持旧页面提交在此拒绝，不改动任何登记。
+    const { ver, pc, reg, patch } = db.transaction(() => {
+      const v = db.prepare('SELECT * FROM rehearsal_versions WHERE id = ?').get(versionId);
+      if (!v) throw new ApiError(404, 'NOT_FOUND', '联排版本不存在');
+      const latest = db.prepare('SELECT id FROM rehearsal_versions ORDER BY version_no DESC LIMIT 1').get();
+      if (!latest || latest.id !== v.id) {
+        throw new ApiError(409, 'VERSION_ARCHIVED',
+          `第 ${v.version_no} 版已不是当前执行版本（已有新版本发布），请刷新使用最新版本登记`);
       }
-      patch = { estimated_end: ee };
-    } else if (action === 'complete') {
-      if (reg.actual_start === null) throw new ApiError(400, 'BAD_STATE', `「${pc.code}」尚未登记实际开始，无法完成`);
-      if (reg.actual_end !== null) throw new ApiError(400, 'BAD_STATE', `「${pc.code}」已完成`);
-      const t = parseOptTime(req.body.time) ?? currentMinute();
-      if (t < reg.actual_start) throw new ApiError(400, 'BAD_INPUT', `完成时刻 ${minToTime(t)} 早于实际开始 ${minToTime(reg.actual_start)}`);
-      patch = { actual_end: t };
-    } else {
-      throw new ApiError(400, 'BAD_INPUT', '未知登记动作');
-    }
 
-    db.prepare(
-      `UPDATE registrations SET ${Object.keys(patch).map((k) => `${k} = @${k}`).join(', ')},
-         row_ver = row_ver + 1, updated_by = @updated_by, updated_at = @updated_at
-       WHERE id = @id`
-    ).run({ ...patch, updated_by: actor, updated_at: stamp, id: reg.id });
+      const c = db.prepare('SELECT * FROM published_cues WHERE version_id=? AND cue_ref=?').get(versionId, cueRef);
+      if (!c) throw new ApiError(404, 'NOT_FOUND', '提示项不存在于该版本');
+
+      // 代班期间：原岗位账号失去该岗位登记权，代班账号获得登记权（且保留自己原有岗位权限）
+      const activeSub = db.prepare(
+        'SELECT u.username, u.display_name FROM position_substitutions s JOIN users u ON u.id = s.deputy_user_id WHERE s.version_id = ? AND s.position = ? AND s.revoked_at IS NULL'
+      ).get(versionId, c.position);
+      if (!accountHoldsPosition(versionId, user, c.position)) {
+        throw new ApiError(403, 'FORBIDDEN',
+          activeSub
+            ? `「${c.code}」属于岗位「${c.position}」，该岗位当前由「${activeSub.display_name}（${activeSub.username}）」代班，原岗位账号暂不能登记，请刷新页面`
+            : `「${c.code}」属于岗位「${c.position}」，当前账号只能登记本岗位提示项`);
+      }
+
+      const r = db.prepare('SELECT * FROM registrations WHERE version_id=? AND cue_ref=?').get(versionId, cueRef);
+      if (!r) throw new ApiError(404, 'NOT_FOUND', '登记记录不存在');
+      if (rowVersion !== r.row_ver) {
+        throw new ApiError(409, 'VERSION_CONFLICT',
+          `「${c.code}」登记已被更新：当前行版本 ${r.row_ver}，提交基于 ${rowVersion}，请刷新后重试`,
+          { currentRowVersion: r.row_ver });
+      }
+
+      let p;
+      if (action === 'start') {
+        if (r.actual_start !== null) throw new ApiError(400, 'BAD_STATE', `「${c.code}」已登记实际开始`);
+        const t = parseOptTime(req.body.time) ?? currentMinute();
+        p = { actual_start: t };
+      } else if (action === 'estimate') {
+        if (r.actual_end !== null) throw new ApiError(400, 'BAD_STATE', `「${c.code}」已完成，不能再修改预计结束`);
+        const ee = parseOptTime(req.body.estimatedEndText);
+        if (ee === null) throw new ApiError(400, 'BAD_INPUT', '请填写预计结束时间（HH:MM）');
+        const lower = r.actual_start !== null ? r.actual_start : c.planned_start;
+        if (ee < lower) {
+          throw new ApiError(400, 'BAD_INPUT',
+            `预计结束 ${minToTime(ee)} 早于${r.actual_start !== null ? '实际开始' : '原计划开始'} ${minToTime(lower)}`);
+        }
+        p = { estimated_end: ee };
+      } else if (action === 'complete') {
+        if (r.actual_start === null) throw new ApiError(400, 'BAD_STATE', `「${c.code}」尚未登记实际开始，无法完成`);
+        if (r.actual_end !== null) throw new ApiError(400, 'BAD_STATE', `「${c.code}」已完成`);
+        const t = parseOptTime(req.body.time) ?? currentMinute();
+        if (t < r.actual_start) throw new ApiError(400, 'BAD_INPUT', `完成时刻 ${minToTime(t)} 早于实际开始 ${minToTime(r.actual_start)}`);
+        p = { actual_end: t };
+      } else {
+        throw new ApiError(400, 'BAD_INPUT', '未知登记动作');
+      }
+
+      db.prepare(
+        `UPDATE registrations SET ${Object.keys(p).map((k) => `${k} = @${k}`).join(', ')},
+           row_ver = row_ver + 1, updated_by = @updated_by, updated_at = @updated_at
+         WHERE id = @id`
+      ).run({ ...p, updated_by: actor, updated_at: stamp, id: r.id });
+
+      return { ver: v, pc: c, reg: r, patch: p };
+    })();
 
     res.json({ version: versionPayload(ver) });
   } catch (e) { next(e); }
