@@ -102,6 +102,13 @@ tr.ho-ineligible td { background: #fdf7f6; }
 .mono { font-variant-numeric: tabular-nums; }
 .latest-tag { background: #2f6fed; color: #fff; border-radius: 8px; padding: 1px 8px; font-size: 11px; margin-left: 6px; }
 
+/* 岗位代班 */
+.deputy-banner { background: #fff7e8; border: 1px solid #ecc57f; color: #7a5200; border-radius: 10px; padding: 10px 14px; margin-bottom: 16px; font-size: 13px; }
+.deputy-banner div + div { margin-top: 4px; }
+.deputy-tag { display: inline-block; margin-top: 2px; font-size: 11px; color: #7a5200; background: #fdf0da; border-radius: 6px; padding: 0 6px; white-space: nowrap; }
+.deputy-form { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-bottom: 12px; }
+.deputy-form select { min-width: 180px; }
+
 /* 舞监更正 */
 .corr-actions { display: flex; flex-direction: column; gap: 4px; align-items: flex-start; }
 .corr-clear-line { flex-direction: row !important; align-items: center; gap: 6px !important; font-size: 13px !important; color: #334 !important; }

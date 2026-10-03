@@ -109,12 +109,24 @@ npm start
 - 更正成功后按现有规则**重算后续未开始项与同岗位冲突**（顺延不早于原计划，冲突在红条展示）；
 - 每次更正都记录**更正项、更正前/更正后值、操作者、时间、原因**；点击行内「更正记录(N)」可回看，历史版本回看页中也可查看（只读）。
 
+#### 现场岗位代班（本轮新增）
+
+现场临时换人时，舞监在「现场联排」页的「岗位代班」面板为**当前执行版**的某个岗位指定一名**已有执行账号**代班：
+
+- **启用 / 撤销**：选择岗位与执行账号后「启用代班」；在任代班行点「撤销」恢复原岗位账号。每次变更都记录**操作者与时间**（启用/撤销各一条），面板与「发布版本」回看页均可查看；
+- **每个版本每个岗位至多一名在任代班**：重复启用返回 409 `DEPUTY_EXISTS`，需先撤销再启用；重复撤销返回 409 `NO_ACTIVE_DEPUTY`；
+- **权限转移**：代班期间**原岗位账号失去该岗位登记权**（提交返回 403 `DEPUTY_ACTIVE`），**代班账号获得该岗位登记权且保留自己原有岗位权限**；撤销后原岗位账号立即恢复，代班账号持旧页面提交会被 403 拒绝且**不改动任何登记**；
+- **仅当前执行版可变更**：启用/撤销只作用于当前执行版；**发布新版后代班不自动延续**（新版无代班），旧版代班记录在回看页**只读可查**；
+- **明确报错不留部分记录**：未知账号（404 `UNKNOWN_ACCOUNT`）、非执行账号（400 `NOT_OPERATOR`）、当前版没有的岗位（400 `POSITION_NOT_IN_VERSION`）、页面版本过期（409 `VERSION_STALE`）均整体拒绝；
+- 登记提交在**同一事务内**复核当前执行版、代班授权与登记行版本，原有登记请求响应、行版本冲突（409）与时间校验保持兼容。
+
 ### 执行岗位
 
 - 「现场联排」页只能看到当前执行版本，本岗位的行高亮并出现操作按钮：
   - **开始**：登记实际开始（默认取当前时间，可手填 HH:MM）；
   - **完成**：登记实际完成（须先开始，完成时刻不得早于开始）；
   - **预计结束**：未开始或已开始均可登记，不得早于（实际或原计划）开始；
+- **代班识别**：若你被指定为某岗位代班，页面顶部黄色横幅提示「你正在代班岗位…」，该岗位行同样高亮并可登记（自己原有岗位权限保留）；若你的岗位被他人代班，横幅提示登记权已移交，本岗位行显示「已由 XX 代班」且不再出现操作按钮；
 - 非本岗位提示项只读；对非最新（已归档）版本不能登记；
 - 已完成项保留实际时间不再变化；未开始项按前置链重算，**重算开始不早于原计划**；
 - 顺延产生的同岗位时段冲突在页面顶部红色横幅逐条展示，同时相关行标注「已顺延」；
@@ -179,8 +191,11 @@ SESSION_SECRET=your-long-random-secret
 | POST/DELETE | `/api/draft/deps[/:id]` | 舞监 | 前置关系增删（校验草稿版本号） |
 | GET | `/api/publish/handover/preview` | 舞监 | **发布前交接预览**：旧执行版已完成项的交接资格、不合格原因、旧登记行版本；无旧版时列表为空 |
 | POST | `/api/publish` | 舞监 | 发布只读版本；冲突返回 422 并列出冲突项；可带 `handover` 交接选择，资格/版本失效返回 409 `HANDOVER_STALE` |
-| GET | `/api/live` | 已登录 | 当前最新版本的现场重算结果（含每行更正历史 `corrections`） |
-| POST | `/api/registrations` | 执行岗位 | start / complete / estimate（校验行版本号、岗位归属、版本最新） |
+| GET | `/api/live` | 已登录 | 当前最新版本的现场重算结果（含每行更正历史 `corrections`、本版代班记录 `deputies`；执行账号另含有效岗位 `myPositions`） |
+| GET | `/api/live/deputies` | 已登录 | 当前执行版代班记录（含已撤销历史）；舞监另返回可选岗位 `positions` 与执行账号 `operators` |
+| POST | `/api/live/deputies` | 舞监 | 启用岗位代班（仅当前执行版）；重复启用 409 `DEPUTY_EXISTS` |
+| POST | `/api/live/deputies/revoke` | 舞监 | 撤销岗位在任代班；无在任代班 409 `NO_ACTIVE_DEPUTY` |
+| POST | `/api/registrations` | 执行岗位 | start / complete / estimate（同一事务内复核当前版、代班授权、行版本号） |
 | POST | `/api/registrations/corrections` | 舞监 | 更正/清除单个登记字段（校验行版本号、仅当前执行版本；级联清除与一致性校验；原子写入更正历史） |
 | GET | `/api/versions` `/api/versions/:id` | 已登录 | 版本列表与历史回看（回看含每行更正历史） |
 
@@ -280,4 +295,82 @@ HTTP 409
 ```
 
 其余既有行为不变：计划冲突仍返回 **422 `PUBLISH_CONFLICT`** 并列出冲突项；草稿版本号过期返回 **409 `VERSION_CONFLICT`**。页面上的勾选与上述 API 完全等价：草稿编辑页发布面板内完成「预览 → 勾选 → 发布」，现场页与版本回看页均可看到延续项的来源标注，旧版登记与更正历史保持可回看。
+
+## 九、岗位代班 API 调用示例
+
+以本地默认端口 3000 为例（`curl -c/-b` 复用会话 Cookie），假设已发布第 1 版为当前执行版。
+
+### 1. 舞监查看当前执行版代班管理视图
+
+```bash
+curl -c sm.cookie -s -X POST http://localhost:3000/api/login \
+  -H 'Content-Type: application/json' -d '{"username":"sm","password":"sm12345"}'
+
+curl -b sm.cookie -s http://localhost:3000/api/live/deputies
+```
+
+响应（舞监含可选岗位与执行账号；`deputies` 含已撤销历史，最新在前）：
+
+```json
+{
+  "versionId": 1,
+  "versionNo": 1,
+  "deputies": [],
+  "positions": ["灯光", "道具", "音响"],
+  "operators": [
+    { "username": "light", "displayName": "灯光执行", "position": "灯光" },
+    { "username": "sound", "displayName": "音响执行", "position": "音响" }
+  ]
+}
+```
+
+### 2. 启用代班（灯光 → 音响执行）
+
+```bash
+curl -b sm.cookie -s -X POST http://localhost:3000/api/live/deputies \
+  -H 'Content-Type: application/json' \
+  -d '{"position":"灯光","username":"sound","versionId":1}'
+```
+
+- `versionId` 可选但建议携带：若页面基于的版本已不是当前执行版，返回 409 `VERSION_STALE`，避免误操作新版本；
+- 成功返回 201 与最新代班管理视图，记录含 `enabledBy` / `enabledAt`（操作者与时间）。
+
+### 3. 代班期间的登记行为
+
+```bash
+# 原岗位账号 light 登记灯光提示项 → 403，登记权已移交
+{"error":"DEPUTY_ACTIVE","message":"岗位「灯光」当前由 音响执行（sound）代班，你的该岗位登记权已暂时移交，请刷新页面"}
+
+# 代班账号 sound 可登记灯光提示项，也可继续登记自己音响岗位（请求格式不变）
+curl -b sound.cookie -s -X POST http://localhost:3000/api/registrations \
+  -H 'Content-Type: application/json' \
+  -d '{"versionId":1,"cueRef":1,"rowVersion":1,"action":"start","time":"19:00"}'
+```
+
+执行账号调用 `GET /api/live` 时，响应 `version.myPositions` 给出当前有效岗位（如 sound 为 `["音响","灯光"]`，light 为 `[]`），现场页面据此显示可操作项；`version.deputies` 列出本版代班记录。
+
+### 4. 撤销代班
+
+```bash
+curl -b sm.cookie -s -X POST http://localhost:3000/api/live/deputies/revoke \
+  -H 'Content-Type: application/json' -d '{"position":"灯光","versionId":1}'
+```
+
+- 撤销后原岗位账号立即恢复登记权；代班账号持旧页面提交返回 403 且**不改动任何登记**；
+- 记录保留 `revokedBy` / `revokedAt`，与启用记录一起在回看页只读可查；重复撤销返回 409 `NO_ACTIVE_DEPUTY`。
+
+### 5. 错误一览（均整体拒绝，不留部分记录）
+
+| 场景 | 状态码 | error |
+| --- | --- | --- |
+| 账号不存在 | 404 | `UNKNOWN_ACCOUNT` |
+| 账号不是执行账号 | 400 | `NOT_OPERATOR` |
+| 当前执行版没有该岗位 | 400 | `POSITION_NOT_IN_VERSION` |
+| 该岗位已有在任代班 | 409 | `DEPUTY_EXISTS` |
+| 撤销时没有任代班 | 409 | `NO_ACTIVE_DEPUTY` |
+| 尚未发布任何版本 | 409 | `NO_LIVE_VERSION` |
+| 页面版本已过期 | 409 | `VERSION_STALE` |
+| 原岗位账号在代班期间登记 | 403 | `DEPUTY_ACTIVE` |
+
+发布新版后代班不自动延续（新版 `deputies` 为空）；旧版记录通过 `GET /api/versions/:id` 的 `deputies` 字段只读可查。
 
